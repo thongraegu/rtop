@@ -452,14 +452,31 @@ fn read_amd_card_stats(card_path: &Path, device_path: &Path, card_name: &str) ->
 fn detect_amd_gpu_name(card_path: &Path, device_path: &Path, card_name: &str) -> String {
     if let Some(name) = read_trimmed_file(&device_path.join("product_name")) {
         if !name.is_empty() {
-            return format!("AMD {name}");
+            return with_amd_prefix(&name);
         }
     }
 
+    let mut pci_slot_name = None;
     if let Some(uevent_text) = read_trimmed_file(&device_path.join("uevent")) {
         if let Some(pci_slot) = parse_uevent_field(&uevent_text, "PCI_SLOT_NAME") {
-            return format!("AMD {pci_slot}");
+            if let Some(name) = read_pci_name_with_lspci(&pci_slot) {
+                return name;
+            }
+            pci_slot_name = Some(pci_slot);
         }
+    }
+
+    if let (Some(vendor_id), Some(device_id)) = (
+        read_pci_hex_id(&device_path.join("vendor")),
+        read_pci_hex_id(&device_path.join("device")),
+    ) {
+        if let Some(name) = read_pci_name_from_ids(&vendor_id, &device_id) {
+            return with_amd_prefix(&name);
+        }
+    }
+
+    if let Some(pci_slot) = pci_slot_name {
+        return format!("AMD {pci_slot}");
     }
 
     if let Some(label) = card_path.file_name().and_then(|label| label.to_str()) {
@@ -482,6 +499,121 @@ fn parse_uevent_field(uevent_text: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn read_pci_name_with_lspci(pci_slot: &str) -> Option<String> {
+    let output = Command::new("lspci").args(["-s", pci_slot]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let line = text.lines().next()?.trim();
+    let (_, device_desc) = line.split_once(": ")?;
+    let device_desc = device_desc
+        .split(" (rev ")
+        .next()
+        .unwrap_or(device_desc)
+        .trim();
+    if device_desc.is_empty() {
+        return None;
+    }
+
+    if let Some(radeon_name) = extract_bracketed_name(device_desc, "Radeon") {
+        return Some(format!("AMD {radeon_name}"));
+    }
+    Some(with_amd_prefix(device_desc))
+}
+
+fn read_pci_name_from_ids(vendor_id: &str, device_id: &str) -> Option<String> {
+    for path in ["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"] {
+        if let Some(name) = read_pci_name_from_ids_file(Path::new(path), vendor_id, device_id) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn read_pci_name_from_ids_file(path: &Path, vendor_id: &str, device_id: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut in_vendor_block = false;
+
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if !line.starts_with('\t') {
+            let mut parts = line.split_whitespace();
+            let Some(current_vendor) = parts.next() else {
+                continue;
+            };
+            in_vendor_block = current_vendor.eq_ignore_ascii_case(vendor_id);
+            continue;
+        }
+
+        if !in_vendor_block {
+            continue;
+        }
+
+        if !line.starts_with('\t') || line.starts_with("\t\t") {
+            continue;
+        }
+
+        let trimmed = line.trim_start_matches('\t');
+        let mut parts = trimmed.split_whitespace();
+        let Some(current_device) = parts.next() else {
+            continue;
+        };
+        if !current_device.eq_ignore_ascii_case(device_id) {
+            continue;
+        }
+
+        let name = trimmed.get(current_device.len()..)?.trim();
+        if name.is_empty() {
+            continue;
+        }
+        return Some(name.to_string());
+    }
+
+    None
+}
+
+fn read_pci_hex_id(path: &Path) -> Option<String> {
+    let raw = read_trimmed_file(path)?;
+    let id = raw.strip_prefix("0x").unwrap_or(&raw).trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.to_ascii_lowercase())
+}
+
+fn with_amd_prefix(name: &str) -> String {
+    let normalized = collapse_whitespace(name);
+    let normalized_lower = normalized.to_ascii_lowercase();
+    if normalized_lower.starts_with("amd ")
+        || normalized_lower.starts_with("advanced micro devices")
+    {
+        normalized
+    } else {
+        format!("AMD {normalized}")
+    }
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn extract_bracketed_name(input: &str, starts_with: &str) -> Option<String> {
+    let needle = format!("[{starts_with}");
+    let start = input.find(&needle)?;
+    let from_bracket = &input[start + 1..];
+    let end = from_bracket.find(']')?;
+    let bracketed = from_bracket[..end].trim();
+    if bracketed.is_empty() {
+        return None;
+    }
+    Some(bracketed.to_string())
 }
 
 fn read_amd_temp_c(device_path: &Path) -> Option<f32> {
@@ -959,6 +1091,19 @@ fn bytes_to_gb(bytes: u64) -> f64 {
 
 fn bytes_to_t(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0)
+}
+
+fn format_disk_usage(used_bytes: u64, total_bytes: u64) -> String {
+    const SMALL_DISK_THRESHOLD_T: f64 = 0.6;
+    let total_t = bytes_to_t(total_bytes);
+    if total_t < SMALL_DISK_THRESHOLD_T {
+        let used_gb = bytes_to_gb(used_bytes);
+        let total_gb = bytes_to_gb(total_bytes);
+        format!("{used_gb:.1}/{total_gb:.1} GB")
+    } else {
+        let used_t = bytes_to_t(used_bytes);
+        format!("{used_t:.2}/{total_t:.2} T")
+    }
 }
 
 fn mib_to_gb(mib: f32) -> f32 {
@@ -1628,17 +1773,18 @@ fn render_mem_disk_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     let ram_used_gb = bytes_to_gb(ram_used_b);
     let ram_total_gb = bytes_to_gb(ram_total_b);
 
-    let (disk_used_t, disk_total_t, disk_pct) = if let Some(storage) = &app.storage {
-        let disk_used_t = bytes_to_t(storage.used_bytes);
-        let disk_total_t = bytes_to_t(storage.total_bytes);
+    let (disk_text, disk_pct) = if let Some(storage) = &app.storage {
         let disk_pct = if storage.total_bytes == 0 {
             0.0
         } else {
             (storage.used_bytes as f32 / storage.total_bytes as f32 * 100.0).clamp(0.0, 100.0)
         };
-        (disk_used_t, disk_total_t, disk_pct)
+        (
+            format_disk_usage(storage.used_bytes, storage.total_bytes),
+            disk_pct,
+        )
     } else {
-        (0.0, 0.0, 0.0)
+        ("n/a".to_string(), 0.0)
     };
 
     if inner.height >= 5 {
@@ -1698,15 +1844,7 @@ fn render_mem_disk_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
             chunks[2],
         );
 
-        let disk_line = value_usage_line(
-            &if app.storage.is_some() {
-                format!("{disk_used_t:.2}/{disk_total_t:.2} T")
-            } else {
-                "n/a".to_string()
-            },
-            disk_pct,
-            COLOR_ACCENT_VRAM,
-        );
+        let disk_line = value_usage_line(&disk_text, disk_pct, COLOR_ACCENT_VRAM);
         f.render_widget(
             Paragraph::new(disk_line).style(Style::default().bg(COLOR_ROW_B)),
             chunks[3],
@@ -1736,14 +1874,7 @@ fn render_mem_disk_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         f.render_widget(Paragraph::new(line_top), chunks[0]);
 
         let line_bottom = Line::from(vec![
-            Span::styled(
-                if app.storage.is_some() {
-                    format!("{disk_used_t:.2}/{disk_total_t:.2} T")
-                } else {
-                    "n/a".to_string()
-                },
-                Style::default().fg(COLOR_ACCENT_VRAM),
-            ),
+            Span::styled(disk_text, Style::default().fg(COLOR_ACCENT_VRAM)),
             Span::styled(
                 format!(" {disk_pct:.1}%"),
                 style_for_usage_with_base(disk_pct, COLOR_ACCENT_VRAM),
