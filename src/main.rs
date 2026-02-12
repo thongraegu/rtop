@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -55,7 +56,7 @@ struct ProcessStat {
 }
 
 #[derive(Debug, Clone)]
-struct NvidiaStats {
+struct GpuStats {
     name: String,
     usage_pct: f32,
     temp_c: f32,
@@ -109,7 +110,7 @@ struct App {
     cpu_temp_c: Option<f32>,
     storage: Option<StorageStats>,
     processes: Vec<ProcessStat>,
-    nvidia: Option<NvidiaStats>,
+    gpu: Option<GpuStats>,
     selected_index: usize,
     selected_pid: Option<String>,
     has_user_navigated_processes: bool,
@@ -130,7 +131,7 @@ impl App {
             cpu_temp_c: None,
             storage: None,
             processes: Vec::new(),
-            nvidia: None,
+            gpu: None,
             selected_index: 0,
             selected_pid: None,
             has_user_navigated_processes: false,
@@ -169,7 +170,7 @@ impl App {
     }
 
     fn refresh_gpu(&mut self) {
-        self.nvidia = read_nvidia_smi();
+        self.gpu = read_gpu_stats();
     }
 
     fn refresh_storage(&mut self) {
@@ -359,7 +360,11 @@ fn send_signal_to_pid(pid: &str, signal: KillSignal) -> Result<()> {
     Err(anyhow!("kill failed: {error_text}"))
 }
 
-fn read_nvidia_smi() -> Option<NvidiaStats> {
+fn read_gpu_stats() -> Option<GpuStats> {
+    read_nvidia_smi().or_else(read_amd_gpu_sysfs)
+}
+
+fn read_nvidia_smi() -> Option<GpuStats> {
     let output = Command::new("nvidia-smi")
         .args([
             "--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total",
@@ -375,13 +380,137 @@ fn read_nvidia_smi() -> Option<NvidiaStats> {
     let output_text = String::from_utf8(output.stdout).ok()?;
     let line = output_text.lines().next()?.trim();
     let mut fields = line.split(',').map(str::trim);
-    Some(NvidiaStats {
+    Some(GpuStats {
         name: fields.next()?.to_string(),
         usage_pct: fields.next()?.parse::<f32>().ok()?,
         temp_c: fields.next()?.parse::<f32>().ok()?,
         vram_used_mib: fields.next()?.parse::<f32>().ok()?,
         vram_total_mib: fields.next()?.parse::<f32>().ok()?,
     })
+}
+
+fn read_amd_gpu_sysfs() -> Option<GpuStats> {
+    let entries = fs::read_dir("/sys/class/drm").ok()?;
+    for entry in entries.flatten() {
+        let card_name = entry.file_name();
+        let card_name = card_name.to_string_lossy();
+        if !is_drm_card_dir(&card_name) {
+            continue;
+        }
+
+        let card_path = entry.path();
+        let device_path = card_path.join("device");
+        let Some(vendor) = read_trimmed_file(&device_path.join("vendor")) else {
+            continue;
+        };
+        if vendor != "0x1002" {
+            continue;
+        }
+
+        if let Some(stats) = read_amd_card_stats(&card_path, &device_path, &card_name) {
+            return Some(stats);
+        }
+    }
+    None
+}
+
+fn is_drm_card_dir(name: &str) -> bool {
+    let Some(index) = name.strip_prefix("card") else {
+        return false;
+    };
+    !index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn read_amd_card_stats(card_path: &Path, device_path: &Path, card_name: &str) -> Option<GpuStats> {
+    let usage_pct = read_f32_from_file(&device_path.join("gpu_busy_percent")).unwrap_or(0.0);
+    let temp_c = read_amd_temp_c(device_path).unwrap_or(0.0);
+    let vram_used_mib = read_u64_from_file(&device_path.join("mem_info_vram_used"))
+        .map(bytes_to_mib)
+        .unwrap_or(0.0);
+    let vram_total_mib = read_u64_from_file(&device_path.join("mem_info_vram_total"))
+        .map(bytes_to_mib)
+        .unwrap_or(0.0);
+    let vram_used_mib = if vram_total_mib > 0.0 {
+        vram_used_mib.min(vram_total_mib)
+    } else {
+        vram_used_mib
+    };
+
+    if usage_pct <= 0.0 && temp_c <= 0.0 && vram_total_mib <= 0.0 {
+        return None;
+    }
+
+    Some(GpuStats {
+        name: detect_amd_gpu_name(card_path, device_path, card_name),
+        usage_pct: usage_pct.clamp(0.0, 100.0),
+        temp_c,
+        vram_used_mib,
+        vram_total_mib,
+    })
+}
+
+fn detect_amd_gpu_name(card_path: &Path, device_path: &Path, card_name: &str) -> String {
+    if let Some(name) = read_trimmed_file(&device_path.join("product_name")) {
+        if !name.is_empty() {
+            return format!("AMD {name}");
+        }
+    }
+
+    if let Some(uevent_text) = read_trimmed_file(&device_path.join("uevent")) {
+        if let Some(pci_slot) = parse_uevent_field(&uevent_text, "PCI_SLOT_NAME") {
+            return format!("AMD {pci_slot}");
+        }
+    }
+
+    if let Some(label) = card_path.file_name().and_then(|label| label.to_str()) {
+        return format!("AMD {label}");
+    }
+
+    format!("AMD {card_name}")
+}
+
+fn parse_uevent_field(uevent_text: &str, key: &str) -> Option<String> {
+    for line in uevent_text.lines() {
+        let Some((field, value)) = line.split_once('=') else {
+            continue;
+        };
+        if field == key {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn read_amd_temp_c(device_path: &Path) -> Option<f32> {
+    let hwmon_root = device_path.join("hwmon");
+    let hwmon_entries = fs::read_dir(hwmon_root).ok()?;
+    for entry in hwmon_entries.flatten() {
+        let sensor_dir = entry.path();
+        for temp_file in ["temp1_input", "temp2_input", "temp3_input"] {
+            let Some(temp_milli_c) = read_u64_from_file(&sensor_dir.join(temp_file)) else {
+                continue;
+            };
+            return Some(temp_milli_c as f32 / 1000.0);
+        }
+    }
+    None
+}
+
+fn read_trimmed_file(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+}
+
+fn read_u64_from_file(path: &Path) -> Option<u64> {
+    read_trimmed_file(path)?.parse::<u64>().ok()
+}
+
+fn read_f32_from_file(path: &Path) -> Option<f32> {
+    read_trimmed_file(path)?.parse::<f32>().ok()
 }
 
 fn read_root_storage() -> Option<StorageStats> {
@@ -836,6 +965,10 @@ fn mib_to_gb(mib: f32) -> f32 {
     mib / 1024.0
 }
 
+fn bytes_to_mib(bytes: u64) -> f32 {
+    bytes as f32 / (1024.0 * 1024.0)
+}
+
 fn main() -> Result<()> {
     run_tui()
 }
@@ -1064,7 +1197,7 @@ fn draw_ui(f: &mut Frame<'_>, app: &App, now: Instant) {
 
     render_telemetry_banner(f, layout[0], app, now);
     render_cpu_grid(f, layout[1], app);
-    render_gpu_panel(f, middle[0], app.nvidia.as_ref());
+    render_gpu_panel(f, middle[0], app.gpu.as_ref());
     render_mem_disk_panel(f, middle[1], app);
     render_process_table(f, layout[3], app, now);
     render_footer(f, layout[4], app, now);
@@ -1306,9 +1439,9 @@ fn render_cpu_grid(f: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn render_gpu_panel(f: &mut Frame<'_>, area: Rect, nvidia: Option<&NvidiaStats>) {
+fn render_gpu_panel(f: &mut Frame<'_>, area: Rect, gpu: Option<&GpuStats>) {
     let title_width = area.width.saturating_sub(4) as usize;
-    let title_text = if let Some(stats) = nvidia {
+    let title_text = if let Some(stats) = gpu {
         truncate_ascii(&format!("GPU {}", stats.name), title_width)
     } else {
         "GPU".to_string()
@@ -1332,8 +1465,8 @@ fn render_gpu_panel(f: &mut Frame<'_>, area: Rect, nvidia: Option<&NvidiaStats>)
         return;
     }
 
-    let Some(stats) = nvidia else {
-        let note = Paragraph::new("No NVIDIA metrics (install/enable nvidia-smi)")
+    let Some(stats) = gpu else {
+        let note = Paragraph::new("No GPU metrics (NVIDIA nvidia-smi / AMD amdgpu sysfs)")
             .style(Style::default().fg(COLOR_MUTED));
         f.render_widget(note, inner);
         return;
