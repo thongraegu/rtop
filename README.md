@@ -1,7 +1,7 @@
 # rtop
 
 `rtop` is a terminal system monitor built with Rust and `ratatui`.  
-It provides a compact, real-time view of CPU, GPU, memory, disk, and top processes.
+It provides a compact, real-time view of CPU, GPU, memory, disk, and top processes with ability to kill processes.
 
 ## Hardware Support
 
