@@ -6,11 +6,11 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
@@ -108,6 +108,7 @@ struct App {
     cpu_pairs: Vec<(usize, Option<usize>)>,
     cpu_model: String,
     cpu_temp_c: Option<f32>,
+    cpu_freq_mhz: Option<u64>,
     storage: Option<StorageStats>,
     processes: Vec<ProcessStat>,
     gpu: Option<GpuStats>,
@@ -117,6 +118,7 @@ struct App {
     process_freeze_until: Option<Instant>,
     kill_menu_open: bool,
     status_message: Option<StatusMessage>,
+    combine_smt: bool,
 }
 
 impl App {
@@ -129,6 +131,7 @@ impl App {
             cpu_pairs: Vec::new(),
             cpu_model: String::new(),
             cpu_temp_c: None,
+            cpu_freq_mhz: None,
             storage: None,
             processes: Vec::new(),
             gpu: None,
@@ -138,6 +141,7 @@ impl App {
             process_freeze_until: None,
             kill_menu_open: false,
             status_message: None,
+            combine_smt: true,
         }
     }
 
@@ -147,6 +151,7 @@ impl App {
         if self.cpu_model.is_empty() {
             self.cpu_model = detect_cpu_model(&self.system);
         }
+        self.cpu_freq_mhz = self.system.cpus().first().map(|c| c.frequency());
         self.cpu_usage_by_id.clear();
         for (idx, cpu) in self.system.cpus().iter().enumerate() {
             let id = parse_logical_cpu_id(cpu.name(), idx);
@@ -1262,6 +1267,10 @@ fn ui_loop(terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>) 
 
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('m') => {
+                        app.combine_smt = !app.combine_smt;
+                        redraw_now = true;
+                    }
                     KeyCode::Up => {
                         app.move_selection(-1, now);
                         redraw_now = true;
@@ -1308,9 +1317,12 @@ fn draw_ui(f: &mut Frame<'_>, app: &App, now: Instant) {
         ])
         .split(content);
 
-    let cpu_target = app
-        .cpu_pairs
-        .len()
+    let cpu_rows_needed = if app.combine_smt {
+        (app.cpu_pairs.len() + 1) / 2
+    } else {
+        app.cpu_pairs.len()
+    };
+    let cpu_target = cpu_rows_needed
         .min(u16::MAX as usize)
         .try_into()
         .unwrap_or(u16::MAX)
@@ -1440,15 +1452,31 @@ fn animated_title_line(width: usize, tick: usize, title: &str, dense: bool) -> L
 
 fn render_cpu_grid(f: &mut Frame<'_>, area: Rect, app: &App) {
     let title_width = area.width.saturating_sub(4) as usize;
-    let title_text = truncate_ascii(&format!("CPU {}", app.cpu_model), title_width);
+    let title_text = truncate_ascii(&app.cpu_model, title_width.saturating_sub(10));
+    let freq_text = app
+        .cpu_freq_mhz
+        .map(|mhz| format!("{:.1} GHz", mhz as f64 / 1000.0))
+        .unwrap_or_else(|| "n/a".to_string());
+
+    let title_line = Line::from(vec![
+        Span::styled(
+            format!(" {title_text} "),
+            Style::default()
+                .fg(COLOR_ACCENT_CPU)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            freq_text,
+            Style::default()
+                .fg(COLOR_MUTED)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .centered();
+
     let block = Block::default()
-        .title(
-            Line::from(format!(" {title_text} ")).centered().style(
-                Style::default()
-                    .fg(COLOR_ACCENT_CPU)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
+        .title(title_line)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(COLOR_BORDER));
@@ -1478,7 +1506,16 @@ fn render_cpu_grid(f: &mut Frame<'_>, area: Rect, app: &App) {
     if rows == 0 {
         return;
     }
-    let shown = rows.min(app.cpu_pairs.len());
+    let shown = if app.combine_smt {
+        (rows * 2).min(app.cpu_pairs.len())
+    } else {
+        rows.min(app.cpu_pairs.len())
+    };
+    let (summary_label, summary_count) = if app.combine_smt {
+        ("Combined ", app.cpu_pairs.len())
+    } else {
+        ("Cores ", app.cpu_pairs.len())
+    };
     let summary = Paragraph::new(Line::from(vec![
         Span::styled("Total ", Style::default().fg(COLOR_MUTED)),
         Span::styled(
@@ -1497,9 +1534,10 @@ fn render_cpu_grid(f: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(COLOR_ACCENT_THREAD)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" | Cores ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(" | ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(summary_label, Style::default().fg(COLOR_MUTED)),
         Span::styled(
-            format!("{}", app.cpu_pairs.len()),
+            format!("{}", summary_count),
             Style::default()
                 .fg(COLOR_ACCENT_CPU)
                 .add_modifier(Modifier::BOLD),
@@ -1508,78 +1546,159 @@ fn render_cpu_grid(f: &mut Frame<'_>, area: Rect, app: &App) {
     .style(Style::default().bg(COLOR_ROW_A));
     f.render_widget(summary, chunks[0]);
 
-    let mut row_constraints = vec![Constraint::Length(1); shown];
-    row_constraints.push(Constraint::Min(0));
-    let row_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(row_constraints)
-        .split(chunks[1]);
+    if app.combine_smt {
+        let pairs_per_row = 2;
+        let num_rows = (shown + pairs_per_row - 1) / pairs_per_row;
+        let actual_rows = num_rows.min(rows);
+        let mut row_constraints = vec![Constraint::Length(1); actual_rows];
+        row_constraints.push(Constraint::Min(0));
+        let row_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(row_constraints)
+            .split(chunks[1]);
 
-    for (row_idx, row_area) in row_chunks.iter().take(shown).enumerate() {
-        let (core_id, smt_id) = app.cpu_pairs[row_idx];
-        let core_usage = app.cpu_usage_by_id.get(&core_id).copied().unwrap_or(0.0);
-        let row_bg = if row_idx.is_multiple_of(2) {
-            COLOR_ROW_A
-        } else {
-            COLOR_ROW_B
-        };
+        for (row_idx, row_area) in row_chunks.iter().take(actual_rows).enumerate() {
+            let left_idx = row_idx * pairs_per_row;
+            let right_idx = left_idx + 1;
 
-        if row_area.width >= 52 {
-            let col_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(50),
-                    Constraint::Length(1),
-                    Constraint::Percentage(49),
-                ])
-                .split(*row_area);
+            if row_area.width >= 52 {
+                let col_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(50),
+                        Constraint::Length(1),
+                        Constraint::Percentage(49),
+                    ])
+                    .split(*row_area);
 
-            let core_line = cpu_lane_line(
-                "C",
-                core_id,
-                core_usage,
-                col_chunks[0].width as usize,
-                COLOR_ACCENT_CPU,
-            );
-            f.render_widget(
-                Paragraph::new(core_line).style(Style::default().bg(row_bg)),
-                col_chunks[0],
-            );
+                let row_bg = if row_idx.is_multiple_of(2) {
+                    COLOR_ROW_A
+                } else {
+                    COLOR_ROW_B
+                };
 
-            let divider =
-                Paragraph::new(Line::from("│").style(Style::default().fg(COLOR_SEPARATOR)))
-                    .style(Style::default().bg(row_bg));
-            f.render_widget(divider, col_chunks[1]);
+                if let Some((core_id, smt_id)) = app.cpu_pairs.get(left_idx) {
+                    let core_usage = app.cpu_usage_by_id.get(core_id).copied().unwrap_or(0.0);
+                    let combined_usage = if let Some(smt_id) = smt_id {
+                        let smt_usage = app.cpu_usage_by_id.get(smt_id).copied().unwrap_or(0.0);
+                        (core_usage + smt_usage) / 2.0
+                    } else {
+                        core_usage
+                    };
+                    let line = cpu_lane_line(
+                        "c",
+                        *core_id,
+                        combined_usage,
+                        col_chunks[0].width as usize,
+                        COLOR_ACCENT_CPU,
+                    );
+                    f.render_widget(
+                        Paragraph::new(line).style(Style::default().bg(row_bg)),
+                        col_chunks[0],
+                    );
+                }
 
-            let thread_line = if let Some(smt_id) = smt_id {
-                let smt_usage = app.cpu_usage_by_id.get(&smt_id).copied().unwrap_or(0.0);
-                cpu_lane_line(
-                    "T",
+                let divider =
+                    Paragraph::new(Line::from("│").style(Style::default().fg(COLOR_SEPARATOR)))
+                        .style(Style::default().bg(row_bg));
+                f.render_widget(divider, col_chunks[1]);
+
+                if let Some((core_id, smt_id)) = app.cpu_pairs.get(right_idx) {
+                    let core_usage = app.cpu_usage_by_id.get(core_id).copied().unwrap_or(0.0);
+                    let combined_usage = if let Some(smt_id) = smt_id {
+                        let smt_usage = app.cpu_usage_by_id.get(smt_id).copied().unwrap_or(0.0);
+                        (core_usage + smt_usage) / 2.0
+                    } else {
+                        core_usage
+                    };
+                    let line = cpu_lane_line(
+                        "c",
+                        *core_id,
+                        combined_usage,
+                        col_chunks[2].width as usize,
+                        COLOR_ACCENT_CPU,
+                    );
+                    f.render_widget(
+                        Paragraph::new(line).style(Style::default().bg(row_bg)),
+                        col_chunks[2],
+                    );
+                }
+            }
+        }
+    } else {
+        let mut row_constraints = vec![Constraint::Length(1); shown];
+        row_constraints.push(Constraint::Min(0));
+        let row_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(row_constraints)
+            .split(chunks[1]);
+
+        for (row_idx, row_area) in row_chunks.iter().take(shown).enumerate() {
+            let (core_id, smt_id) = app.cpu_pairs[row_idx];
+            let core_usage = app.cpu_usage_by_id.get(&core_id).copied().unwrap_or(0.0);
+            let row_bg = if row_idx.is_multiple_of(2) {
+                COLOR_ROW_A
+            } else {
+                COLOR_ROW_B
+            };
+
+            if row_area.width >= 52 {
+                let col_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(50),
+                        Constraint::Length(1),
+                        Constraint::Percentage(49),
+                    ])
+                    .split(*row_area);
+
+                let core_line = cpu_lane_line(
+                    "C",
+                    core_id,
+                    core_usage,
+                    col_chunks[0].width as usize,
+                    COLOR_ACCENT_CPU,
+                );
+                f.render_widget(
+                    Paragraph::new(core_line).style(Style::default().bg(row_bg)),
+                    col_chunks[0],
+                );
+
+                let divider =
+                    Paragraph::new(Line::from("│").style(Style::default().fg(COLOR_SEPARATOR)))
+                        .style(Style::default().bg(row_bg));
+                f.render_widget(divider, col_chunks[1]);
+
+                let thread_line = if let Some(smt_id) = smt_id {
+                    let smt_usage = app.cpu_usage_by_id.get(&smt_id).copied().unwrap_or(0.0);
+                    cpu_lane_line(
+                        "T",
+                        smt_id,
+                        smt_usage,
+                        col_chunks[2].width as usize,
+                        COLOR_ACCENT_THREAD,
+                    )
+                } else {
+                    cpu_lane_placeholder("T", col_chunks[2].width as usize, COLOR_ACCENT_THREAD)
+                };
+                f.render_widget(
+                    Paragraph::new(thread_line).style(Style::default().bg(row_bg)),
+                    col_chunks[2],
+                );
+            } else {
+                let smt_usage = smt_id.and_then(|id| app.cpu_usage_by_id.get(&id).copied());
+                let compact = cpu_pair_narrow_line(
+                    core_id,
+                    core_usage,
                     smt_id,
                     smt_usage,
-                    col_chunks[2].width as usize,
-                    COLOR_ACCENT_THREAD,
-                )
-            } else {
-                cpu_lane_placeholder("T", col_chunks[2].width as usize, COLOR_ACCENT_THREAD)
-            };
-            f.render_widget(
-                Paragraph::new(thread_line).style(Style::default().bg(row_bg)),
-                col_chunks[2],
-            );
-        } else {
-            let smt_usage = smt_id.and_then(|id| app.cpu_usage_by_id.get(&id).copied());
-            let compact = cpu_pair_narrow_line(
-                core_id,
-                core_usage,
-                smt_id,
-                smt_usage,
-                row_area.width as usize,
-            );
-            f.render_widget(
-                Paragraph::new(compact).style(Style::default().bg(row_bg)),
-                *row_area,
-            );
+                    row_area.width as usize,
+                );
+                f.render_widget(
+                    Paragraph::new(compact).style(Style::default().bg(row_bg)),
+                    *row_area,
+                );
+            }
         }
     }
 }
@@ -2099,6 +2218,24 @@ fn render_footer(f: &mut Frame<'_>, area: Rect, app: &App, now: Instant) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" actions  |  ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(
+            "m",
+            Style::default()
+                .fg(if app.combine_smt {
+                    COLOR_OK
+                } else {
+                    COLOR_ACCENT_PROC
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if app.combine_smt {
+                " cpu mode  |  "
+            } else {
+                " thread mode  |  "
+            },
+            Style::default().fg(COLOR_MUTED),
+        ),
         Span::styled(
             "q/Esc",
             Style::default()
