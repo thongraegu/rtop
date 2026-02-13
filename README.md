@@ -10,7 +10,7 @@ It provides a compact, real-time view of CPU, GPU, memory, disk, and top process
   - NVIDIA via `nvidia-smi`.
   - AMD via Linux `amdgpu` sysfs metrics under `/sys/class/drm`.
 
-![rtop screenshot](./rtop.png)
+![rtop screenshot](./rtop3.png)
 
 ## Clone
 
