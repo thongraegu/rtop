@@ -703,8 +703,9 @@ fn render_gpu_panel(f: &mut Frame<'_>, area: Rect, gpu: Option<&GpuStats>) {
     }
 
     let Some(stats) = gpu else {
-        let note = Paragraph::new("No GPU metrics (NVIDIA nvidia-smi / AMD amdgpu sysfs)")
-            .style(Style::default().fg(COLOR_MUTED));
+        let note =
+            Paragraph::new("No GPU metrics (NVIDIA nvidia-smi / AMD amdgpu / Intel i915/xe sysfs)")
+                .style(Style::default().fg(COLOR_MUTED));
         f.render_widget(note, inner);
         return;
     };

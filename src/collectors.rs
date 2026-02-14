@@ -341,7 +341,9 @@ pub fn send_signal_to_pid(pid: &str, signal: KillSignal) -> Result<()> {
 }
 
 pub fn read_gpu_stats() -> Option<GpuStats> {
-    read_nvidia_smi().or_else(read_amd_gpu_sysfs)
+    read_nvidia_smi()
+        .or_else(read_amd_gpu_sysfs)
+        .or_else(read_intel_gpu_sysfs)
 }
 
 fn read_nvidia_smi() -> Option<GpuStats> {
@@ -394,6 +396,31 @@ fn read_amd_gpu_sysfs() -> Option<GpuStats> {
     None
 }
 
+fn read_intel_gpu_sysfs() -> Option<GpuStats> {
+    let entries = fs::read_dir("/sys/class/drm").ok()?;
+    for entry in entries.flatten() {
+        let card_name = entry.file_name();
+        let card_name = card_name.to_string_lossy();
+        if !is_drm_card_dir(&card_name) {
+            continue;
+        }
+
+        let card_path = entry.path();
+        let device_path = card_path.join("device");
+        let Some(vendor) = read_trimmed_file(&device_path.join("vendor")) else {
+            continue;
+        };
+        if vendor != "0x8086" {
+            continue;
+        }
+
+        if let Some(stats) = read_intel_card_stats(&card_path, &device_path, &card_name) {
+            return Some(stats);
+        }
+    }
+    None
+}
+
 fn is_drm_card_dir(name: &str) -> bool {
     let Some(index) = name.strip_prefix("card") else {
         return false;
@@ -403,7 +430,7 @@ fn is_drm_card_dir(name: &str) -> bool {
 
 fn read_amd_card_stats(card_path: &Path, device_path: &Path, card_name: &str) -> Option<GpuStats> {
     let usage_pct = read_f32_from_file(&device_path.join("gpu_busy_percent")).unwrap_or(0.0);
-    let temp_c = read_amd_temp_c(device_path).unwrap_or(0.0);
+    let temp_c = read_hwmon_temp_c(device_path).unwrap_or(0.0);
     let vram_used_mib = read_u64_from_file(&device_path.join("mem_info_vram_used"))
         .map(bytes_to_mib)
         .unwrap_or(0.0);
@@ -422,6 +449,30 @@ fn read_amd_card_stats(card_path: &Path, device_path: &Path, card_name: &str) ->
 
     Some(GpuStats {
         name: detect_amd_gpu_name(card_path, device_path, card_name),
+        usage_pct: usage_pct.clamp(0.0, 100.0),
+        temp_c,
+        vram_used_mib,
+        vram_total_mib,
+    })
+}
+
+fn read_intel_card_stats(
+    card_path: &Path,
+    device_path: &Path,
+    card_name: &str,
+) -> Option<GpuStats> {
+    let usage_pct = read_intel_usage_pct(card_path, device_path).unwrap_or(0.0);
+    let temp_c = read_hwmon_temp_c(device_path).unwrap_or(0.0);
+    let (vram_used_mib, vram_total_mib) =
+        read_intel_local_memory_mib(device_path).unwrap_or((0.0, 0.0));
+    let vram_used_mib = if vram_total_mib > 0.0 {
+        vram_used_mib.min(vram_total_mib)
+    } else {
+        vram_used_mib
+    };
+
+    Some(GpuStats {
+        name: detect_intel_gpu_name(card_path, device_path, card_name),
         usage_pct: usage_pct.clamp(0.0, 100.0),
         temp_c,
         vram_used_mib,
@@ -466,6 +517,43 @@ fn detect_amd_gpu_name(card_path: &Path, device_path: &Path, card_name: &str) ->
     format!("AMD {card_name}")
 }
 
+fn detect_intel_gpu_name(card_path: &Path, device_path: &Path, card_name: &str) -> String {
+    if let Some(name) = read_trimmed_file(&device_path.join("product_name")) {
+        if !name.is_empty() {
+            return with_intel_prefix(&name);
+        }
+    }
+
+    let mut pci_slot_name = None;
+    if let Some(uevent_text) = read_trimmed_file(&device_path.join("uevent")) {
+        if let Some(pci_slot) = parse_uevent_field(&uevent_text, "PCI_SLOT_NAME") {
+            if let Some(name) = read_pci_name_with_lspci_raw(&pci_slot) {
+                return with_intel_prefix(&name);
+            }
+            pci_slot_name = Some(pci_slot);
+        }
+    }
+
+    if let (Some(vendor_id), Some(device_id)) = (
+        read_pci_hex_id(&device_path.join("vendor")),
+        read_pci_hex_id(&device_path.join("device")),
+    ) {
+        if let Some(name) = read_pci_name_from_ids(&vendor_id, &device_id) {
+            return with_intel_prefix(&name);
+        }
+    }
+
+    if let Some(pci_slot) = pci_slot_name {
+        return format!("Intel {pci_slot}");
+    }
+
+    if let Some(label) = card_path.file_name().and_then(|label| label.to_str()) {
+        return format!("Intel {label}");
+    }
+
+    format!("Intel {card_name}")
+}
+
 fn parse_uevent_field(uevent_text: &str, key: &str) -> Option<String> {
     for line in uevent_text.lines() {
         let Some((field, value)) = line.split_once('=') else {
@@ -482,6 +570,14 @@ fn parse_uevent_field(uevent_text: &str, key: &str) -> Option<String> {
 }
 
 fn read_pci_name_with_lspci(pci_slot: &str) -> Option<String> {
+    let device_desc = read_pci_name_with_lspci_raw(pci_slot)?;
+    if let Some(radeon_name) = extract_bracketed_name(&device_desc, "Radeon") {
+        return Some(format!("AMD {radeon_name}"));
+    }
+    Some(with_amd_prefix(&device_desc))
+}
+
+fn read_pci_name_with_lspci_raw(pci_slot: &str) -> Option<String> {
     let output = Command::new("lspci").args(["-s", pci_slot]).output().ok()?;
     if !output.status.success() {
         return None;
@@ -499,10 +595,7 @@ fn read_pci_name_with_lspci(pci_slot: &str) -> Option<String> {
         return None;
     }
 
-    if let Some(radeon_name) = extract_bracketed_name(device_desc, "Radeon") {
-        return Some(format!("AMD {radeon_name}"));
-    }
-    Some(with_amd_prefix(device_desc))
+    Some(device_desc.to_string())
 }
 
 fn read_pci_name_from_ids(vendor_id: &str, device_id: &str) -> Option<String> {
@@ -580,6 +673,16 @@ fn with_amd_prefix(name: &str) -> String {
     }
 }
 
+fn with_intel_prefix(name: &str) -> String {
+    let normalized = collapse_whitespace(name);
+    let normalized_lower = normalized.to_ascii_lowercase();
+    if normalized_lower.starts_with("intel ") || normalized_lower.starts_with("intel corporation") {
+        normalized
+    } else {
+        format!("Intel {normalized}")
+    }
+}
+
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -596,7 +699,7 @@ fn extract_bracketed_name(input: &str, starts_with: &str) -> Option<String> {
     Some(bracketed.to_string())
 }
 
-fn read_amd_temp_c(device_path: &Path) -> Option<f32> {
+fn read_hwmon_temp_c(device_path: &Path) -> Option<f32> {
     let hwmon_root = device_path.join("hwmon");
     let hwmon_entries = fs::read_dir(hwmon_root).ok()?;
     for entry in hwmon_entries.flatten() {
@@ -609,6 +712,103 @@ fn read_amd_temp_c(device_path: &Path) -> Option<f32> {
         }
     }
     None
+}
+
+fn read_intel_usage_pct(card_path: &Path, device_path: &Path) -> Option<f32> {
+    for path in [
+        card_path.join("gt_busy_percent"),
+        device_path.join("gpu_busy_percent"),
+        device_path.join("gt_busy_percent"),
+        card_path.join("gt/gt0/busy"),
+        device_path.join("gt/gt0/busy"),
+        device_path.join("tile0/gt0/busy"),
+    ] {
+        if let Some(usage_pct) = read_f32_from_file(&path) {
+            return Some(usage_pct.clamp(0.0, 100.0));
+        }
+    }
+
+    for (act_path, max_path) in [
+        (
+            card_path.join("gt_act_freq_mhz"),
+            card_path.join("gt_max_freq_mhz"),
+        ),
+        (
+            device_path.join("gt/gt0/rps_act_freq_mhz"),
+            device_path.join("gt/gt0/rps_max_freq_mhz"),
+        ),
+        (
+            device_path.join("tile0/gt0/freq0/act_freq"),
+            device_path.join("tile0/gt0/freq0/max_freq"),
+        ),
+        (
+            device_path.join("gt/gt0/freq0/act_freq"),
+            device_path.join("gt/gt0/freq0/max_freq"),
+        ),
+    ] {
+        let Some(act_freq) = read_f32_from_file(&act_path) else {
+            continue;
+        };
+        let Some(max_freq) = read_f32_from_file(&max_path) else {
+            continue;
+        };
+        if max_freq > 0.0 {
+            return Some((act_freq / max_freq * 100.0).clamp(0.0, 100.0));
+        }
+    }
+
+    None
+}
+
+fn read_intel_local_memory_mib(device_path: &Path) -> Option<(f32, f32)> {
+    if let (Some(used_bytes), Some(total_bytes)) = (
+        read_u64_from_file(&device_path.join("lmem_used_bytes")),
+        read_u64_from_file(&device_path.join("lmem_total_bytes")),
+    ) {
+        return Some((bytes_to_mib(used_bytes), bytes_to_mib(total_bytes)));
+    }
+
+    read_intel_memory_regions_mib(device_path)
+}
+
+fn read_intel_memory_regions_mib(device_path: &Path) -> Option<(f32, f32)> {
+    let entries = fs::read_dir(device_path).ok()?;
+    let mut total_bytes = 0_u64;
+    let mut used_bytes = 0_u64;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("memory_region") {
+            continue;
+        }
+
+        let is_local = read_trimmed_file(&path.join("name"))
+            .map(|region_name| {
+                let region_name = region_name.to_ascii_lowercase();
+                region_name.starts_with("local") || region_name.starts_with("lmem")
+            })
+            .unwrap_or(false);
+        if !is_local {
+            continue;
+        }
+
+        let Some(region_total) = read_u64_from_file(&path.join("total"))
+            .or_else(|| read_u64_from_file(&path.join("size")))
+        else {
+            continue;
+        };
+        let region_used = read_u64_from_file(&path.join("used")).unwrap_or(0);
+        total_bytes = total_bytes.saturating_add(region_total);
+        used_bytes = used_bytes.saturating_add(region_used.min(region_total));
+    }
+
+    if total_bytes == 0 {
+        return None;
+    }
+
+    Some((bytes_to_mib(used_bytes), bytes_to_mib(total_bytes)))
 }
 
 fn read_trimmed_file(path: &Path) -> Option<String> {
