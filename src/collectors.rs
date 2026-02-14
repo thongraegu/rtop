@@ -39,14 +39,21 @@ pub fn top_processes(system: &System, limit: usize) -> Vec<ProcessStat> {
     let mut rows: Vec<ProcessStat> = system
         .processes()
         .iter()
-        .map(|(pid, process)| ProcessStat {
-            app: detect_process_app_name(process),
-            pid: pid.to_string(),
-            name: process.name().to_string_lossy().to_string(),
-            mem_mib: process.memory() / (1024 * 1024),
-            // Normalize per-process CPU by logical CPU count to match tools
-            // that report usage against total system capacity (e.g. btop).
-            cpu: (process.cpu_usage() / logical_cpus).clamp(0.0, 100.0),
+        // On Linux, sysinfo exposes tasks/threads as process entries as well.
+        // Keep only thread-group leaders so process counts and memory totals
+        // align with standard "process list" expectations.
+        .filter(|(_, process)| process.thread_kind().is_none())
+        .map(|(pid, process)| {
+            let pid = pid.to_string();
+            ProcessStat {
+                app: detect_process_app_name(process),
+                pid: pid.clone(),
+                name: process.name().to_string_lossy().to_string(),
+                mem_mib: process_mem_mib(&pid, process),
+                // Normalize per-process CPU by logical CPU count to match tools
+                // that report usage against total system capacity (e.g. btop).
+                cpu: (process.cpu_usage() / logical_cpus).clamp(0.0, 100.0),
+            }
         })
         .collect();
 
@@ -58,6 +65,28 @@ pub fn top_processes(system: &System, limit: usize) -> Vec<ProcessStat> {
     });
     rows.truncate(limit);
     rows
+}
+
+fn process_mem_mib(pid: &str, process: &sysinfo::Process) -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(pss_kib) = read_pss_kib(pid) {
+        return pss_kib / 1024;
+    }
+
+    process.memory() / (1024 * 1024)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_pss_kib(pid: &str) -> Option<u64> {
+    let content = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    for line in content.lines() {
+        let Some(rest) = line.strip_prefix("Pss:") else {
+            continue;
+        };
+        let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        return Some(kib);
+    }
+    None
 }
 
 fn detect_process_app_name(process: &sysinfo::Process) -> String {
